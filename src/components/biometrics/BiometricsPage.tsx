@@ -69,11 +69,17 @@ function BiometricsBody({ sectionSwitch, now }: { sectionSwitch?: ReactNode, now
   const dataPathQ = trpc.health.dataPath.useQuery({}, { refetchInterval: 60_000 })
   const fileCountQ = trpc.biometrics.getFileCount.useQuery({}, { refetchInterval: 60_000 })
   const movementQ = trpc.biometrics.getMovementBuckets.useQuery({ side, startDate, endDate, bucketSeconds: 300, limit: 10000 }, { refetchInterval: 5 * 60_000 })
+  // Imported Apple Watch heart rate (scripts/import-watch-health.py), drawn over the pod's.
+  // No placeholderData: after a side switch the other person's Watch samples
+  // must not sit over this side's pod line while the new query loads.
+  const referenceQ = trpc.biometrics.getReferenceVitals.useQuery({ side, startDate, endDate, limit: 20000 }, { refetchInterval: 5 * 60_000 })
 
   const rows = (vitalsQ.data ?? []) as VitalRow[]
   const points: VitalPoint[] = rows.map(r => ({ t: new Date(r.timestamp).getTime(), hr: r.heartRate, hrv: r.hrv, br: r.breathingRate }))
   const sessions = splitSessions(points)
   const bands = { hr: baselineBand(points, 'hr'), hrv: baselineBand(points, 'hrv'), br: baselineBand(points, 'br') }
+  const reference = ((referenceQ.data ?? []) as Array<{ timestamp: Date | string, heartRate: number }>)
+    .map(r => ({ t: new Date(r.timestamp).getTime(), hr: r.heartRate }))
 
   const lastVitalAt = latestQ.data?.[0] ? new Date(latestQ.data[0].timestamp).getTime() : null
   const occupied = occupancyQ.data?.[side].occupied ?? false
@@ -175,11 +181,11 @@ function BiometricsBody({ sectionSwitch, now }: { sectionSwitch?: ReactNode, now
             : (
                 <div className="-mx-[18px] overflow-x-auto px-[18px]">
                   <div className="min-w-[560px]">
-                    <VitalsChart sessions={sessions} stall={stall} bands={bands} />
+                    <VitalsChart sessions={sessions} stall={stall} bands={bands} reference={reference} />
                   </div>
                 </div>
               )}
-        <VitalsLegend bandLabel={bandLabel} stalled={!!stall} />
+        <VitalsLegend bandLabel={bandLabel} stalled={!!stall} reference={reference.length > 0} />
       </div>
 
       <SidesCard occupancy={occupancyQ.data} sideName={sideName} />
