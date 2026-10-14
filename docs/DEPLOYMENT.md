@@ -227,6 +227,17 @@ sp-logs                # tail service logs (journalctl -f)
 sp-update [branch]     # self-update from GitHub (handles iptables)
 ```
 
+## Accessing the Pod by Hostname
+
+The API has no authentication, so the server rejects any `Host` header that isn't a pod address (HTTP 403). This stops DNS-rebinding pages. These work out of the box: IP addresses (`http://192.168.1.88:3000`), `localhost`, single-label names (`eight-pod`), and names ending in `.local`, `.lan`, `.home.arpa`, `.internal` or `.localhost`. To reach the pod through another name, such as a Tailscale MagicDNS name or a reverse proxy, list it in `SLEEPYPOD_ALLOWED_HOSTS`. Entries are comma-separated, and each is an exact host or `*.suffix`:
+
+```bash
+sudo mkdir -p /etc/systemd/system/sleepypod.service.d
+printf '[Service]\nEnvironment="SLEEPYPOD_ALLOWED_HOSTS=pod.tail1234.ts.net,*.example.com"\n' \
+  | sudo tee /etc/systemd/system/sleepypod.service.d/allowed-hosts.conf
+sudo systemctl daemon-reload && sp-restart
+```
+
 ## Network Security (Telemetry Blocking)
 
 The pod runs two stock processes that continuously attempt to phone home:
@@ -293,3 +304,19 @@ sudo bash /tmp/sleepypod-install --purge-free-sleep
 It also flushes the running iptables and ip6tables rules; the install then reconfigures iptables itself. Without the flag, run the cleanup block the installer prints, reboot, and re-run the installer. free-sleep's `unblock_internet_access.sh` is not a substitute: it flushes runtime rules only and leaves the persisted files in place.
 
 Run `sp-uninstall` if you want to revert (the script flushes iptables and removes sleepypod's units); the purge is not undone, so reinstall free-sleep from its own installer.
+
+
+### Runtime filesystem reads and standalone tracing
+
+Pod data (RAW captures, saved alarm state, HomeKit identity seeds, archive-push
+configuration, procfs and storage-accounting paths) is read on the destination
+pod. These dynamic filesystem reads use `turbopackIgnore` call annotations so
+Next does not infer that the build machine's whole checkout belongs in the
+standalone output. The annotations affect packaging only; existing validation,
+file access and error handling still run on the pod.
+
+The biometrics worker location probes are also excluded from automatic tracing:
+`scripts/build/biometrics-worker.mjs` explicitly generates `worker.cjs`,
+`coordinator.cjs` and `shadow-host.cjs` in the standalone bundle after Next builds.
+Keep that packaging step and its dependency-graph checks when changing tracing.
+Do not apply these annotations to shipped assets that need inclusion in a release.

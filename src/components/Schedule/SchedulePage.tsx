@@ -12,6 +12,7 @@ import { useScheduleActive } from '@/src/hooks/useScheduleActive'
 import { useSide } from '@/src/providers/SideProvider'
 import type { Side, SideSelection } from '@/src/providers/SideProvider'
 import { useSideNames } from '@/src/hooks/useSideNames'
+import { useCurveTemplates } from '@/src/hooks/useCurveTemplates'
 import { useTemperatureUnit } from '@/src/hooks/useTemperatureUnit'
 import { formatSetpointF } from '@/src/lib/tempUtils'
 import { groupDaysBySharedCurve } from '@/src/lib/scheduleGrouping'
@@ -23,6 +24,7 @@ import { nextSetPoint, type TempRow } from './bothNight'
 import { CurveCard } from './CurveCard'
 import { useNowMinute } from './CurveChart'
 import { CurveEditor } from './CurveEditor'
+import { SavedCurveCard, templateSetPoints } from './SavedCurveCard'
 import { ConfirmDialog } from './ConfirmDialog'
 import { ScheduleToggle } from './ScheduleToggle'
 import { SchedulerConfirmation } from './SchedulerConfirmation'
@@ -33,6 +35,7 @@ interface EditingCurve {
   days: DayOfWeek[]
   endAction?: 'turn_off' | 'maintain'
   setPoints: Array<{ time: string, temperature: number }>
+  notes?: string
 }
 
 interface SchedulePageProps {
@@ -42,6 +45,8 @@ interface SchedulePageProps {
   curveSide?: SideSelection
   /** ?from=both: the editor was opened from the Both view and returns to it. */
   fromBoth?: boolean
+  /** ?saved=<name> on /schedule/new: start the new curve from this saved curve. */
+  savedCurve?: string
 }
 
 /**
@@ -51,7 +56,7 @@ interface SchedulePageProps {
  * at its own URL (/schedule/new, /schedule/mon-tue-wed?side=left), so a
  * curve can be linked to directly.
  */
-export function SchedulePage({ curve, curveSide, fromBoth = false }: SchedulePageProps = {}) {
+export function SchedulePage({ curve, curveSide, fromBoth = false, savedCurve }: SchedulePageProps = {}) {
   // Focus one source only when the unused zone has no independent schedule.
   const { primarySide, selectedSide: chosenSide, selectSide, singleScheduleSide } = useSide()
   const side = singleScheduleSide ?? primarySide
@@ -72,6 +77,9 @@ export function SchedulePage({ curve, curveSide, fromBoth = false }: SchedulePag
   const { nextEvent } = useScheduleActive()
   const { leftName, rightName } = useSideNames()
   const { data, isLoading, error } = trpc.schedules.getAll.useQuery({ side })
+  const { data: notesData, isLoading: notesLoading } = trpc.schedules.getNotes.useQuery({ side })
+  // A curve's days normally share one note; show the first one set.
+  const notesFor = (days: DayOfWeek[]) => days.map(d => notesData?.find(n => n.dayOfWeek === d)?.notes).find(Boolean)
   const both = selectedSide === 'both'
   const otherSide: Side = side === 'left' ? 'right' : 'left'
   const other = trpc.schedules.getAll.useQuery({ side: otherSide }, { enabled: both })
@@ -79,6 +87,8 @@ export function SchedulePage({ curve, curveSide, fromBoth = false }: SchedulePag
   const bothTemps = { [side]: data?.temperature, [otherSide]: other.data?.temperature } as Record<Side, TempRow[] | undefined>
   const names: Record<Side, string> = { left: leftName, right: rightName }
   const nowMinute = useNowMinute()
+  const saved = useCurveTemplates()
+  const [pendingSavedDelete, setPendingSavedDelete] = useState<string | null>(null)
 
   // Last night's measured bed temperature for the featured chart.
   const now = nowMinute === null ? null : new Date(nowMinute * 60_000)
@@ -144,10 +154,11 @@ export function SchedulePage({ curve, curveSide, fromBoth = false }: SchedulePag
     ?? null
   const others = visibleGroups.filter(g => g !== featured)
 
-  const curveHref = useCallback((slug: string, linkSide: SideSelection | null, from?: 'both') => {
+  const curveHref = useCallback((slug: string, linkSide: SideSelection | null, from?: 'both', savedName?: string) => {
     const params = new URLSearchParams()
     if (linkSide) params.set('side', linkSide)
     if (from) params.set('from', from)
+    if (savedName) params.set('saved', savedName)
     const qs = params.toString()
     return `${schedulePath}/${slug}${qs ? `?${qs}` : ''}`
   }, [schedulePath])
@@ -159,6 +170,10 @@ export function SchedulePage({ curve, curveSide, fromBoth = false }: SchedulePag
 
   const handleCreate = useCallback(() => {
     router.push(curveHref('new', singleScheduleSide ? null : selectedSide))
+  }, [router, curveHref, singleScheduleSide, selectedSide])
+
+  const handleUseSaved = useCallback((name: string) => {
+    router.push(curveHref('new', singleScheduleSide ? null : selectedSide, undefined, name))
   }, [router, curveHref, singleScheduleSide, selectedSide])
 
   const handleDelete = useCallback((group: ScheduleGroup) => {
@@ -191,13 +206,16 @@ export function SchedulePage({ curve, curveSide, fromBoth = false }: SchedulePag
     const linkedDays = curve === 'new' ? null : parseCurveSlug(curve)
     const group = linkedDays ? visibleGroups.find(g => sameDays(g.days, linkedDays)) : undefined
     const sideReady = !wantSide || chosenSide === wantSide
-    if (!sideReady || (curve === 'new' ? settingsLoading : isLoading && !data)) {
+    const savedLoading = curve === 'new' && savedCurve !== undefined && saved.isLoading
+    // The editor keeps its first notes, so an existing curve waits for them; saving an unloaded note would clear it.
+    if (!sideReady || savedLoading || (curve === 'new' ? settingsLoading : (isLoading && !data) || notesLoading)) {
       return <Skeleton className="h-[520px]" />
     }
-    const editorKey = `${curve}:${side}`
+    const editorKey = `${curve}:${side}:${savedCurve ?? ''}`
+    const template = curve === 'new' && savedCurve !== undefined ? saved.templates.find(t => t.name === savedCurve) : undefined
     const found: EditingCurve | null = curve === 'new'
-      ? { days: [], setPoints: [], endAction: settings?.device.defaultScheduleEndAction ?? 'turn_off' }
-      : group ? { days: group.days, setPoints: group.setPoints, endAction: group.endAction } : null
+      ? { days: [], setPoints: template ? templateSetPoints(template) : [], endAction: settings?.device.defaultScheduleEndAction ?? 'turn_off', notes: template?.notes }
+      : group ? { days: group.days, setPoints: group.setPoints, endAction: group.endAction, notes: notesFor(group.days) } : null
     if (found && openedCurve?.key !== editorKey) setOpenedCurve({ key: editorKey, editor: found })
     const editor = openedCurve?.key === editorKey ? openedCurve.editor : found
     if (!editor) {
@@ -223,6 +241,7 @@ export function SchedulePage({ curve, curveSide, fromBoth = false }: SchedulePag
         initialEndAction={editor.endAction}
         initialDays={editor.days}
         initialSetPoints={editor.setPoints}
+        initialNotes={editor.notes}
       />
     )
   }
@@ -329,6 +348,7 @@ export function SchedulePage({ curve, curveSide, fromBoth = false }: SchedulePag
               isActive={featured.key === activeCurveKey}
               nextEvent={featured.key === activeCurveKey ? nextEvent : null}
               bed={bed}
+              notes={notesFor(featured.days)}
             />
           )}
 
@@ -338,6 +358,7 @@ export function SchedulePage({ curve, curveSide, fromBoth = false }: SchedulePag
                 <CurveCard
                   key={group.key}
                   group={group}
+                  notes={notesFor(group.days)}
                   onEdit={() => handleEdit(group)}
                   onDelete={() => handleDelete(group)}
                 />
@@ -352,6 +373,22 @@ export function SchedulePage({ curve, curveSide, fromBoth = false }: SchedulePag
               </Button>
             </div>
           )}
+
+          {saved.templates.length > 0 && (
+            <>
+              <SectionLabel className="mt-1">Saved curves</SectionLabel>
+              <div className="grid gap-3.5 min-[900px]:grid-cols-3 min-[900px]:gap-3">
+                {saved.templates.map(t => (
+                  <SavedCurveCard
+                    key={t.name}
+                    template={t}
+                    onUse={() => handleUseSaved(t.name)}
+                    onDelete={() => setPendingSavedDelete(t.name)}
+                  />
+                ))}
+              </div>
+            </>
+          )}
         </div>
 
         <div className="flex min-w-0 flex-col gap-3">
@@ -359,6 +396,19 @@ export function SchedulePage({ curve, curveSide, fromBoth = false }: SchedulePag
           <SchedulerStatus sideLabel={sideLabel} next={next} />
         </div>
       </div>
+
+      <ConfirmDialog
+        open={pendingSavedDelete !== null}
+        title="Delete saved curve?"
+        message={`"${pendingSavedDelete ?? ''}" will be removed from saved curves. Days already using it keep their schedule.`}
+        confirmLabel="Delete"
+        variant="danger"
+        busy={saved.isDeleting}
+        onConfirm={() => {
+          if (pendingSavedDelete) void saved.remove(pendingSavedDelete).finally(() => setPendingSavedDelete(null))
+        }}
+        onCancel={() => setPendingSavedDelete(null)}
+      />
 
       <ConfirmDialog
         open={pendingDelete !== null}

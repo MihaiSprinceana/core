@@ -6,7 +6,6 @@ import {
   demoMovement,
   demoNights,
   demoNightsOverlapping,
-  demoStageEpochs,
   demoVitals,
   editDemoNight,
   findDemoNight,
@@ -16,6 +15,8 @@ import {
 } from '../history'
 import type { DemoHandlers, RouterOutputs } from '../types'
 import { DAY, MINUTE } from '../util'
+import { classifyDemoWindow } from '../biometrics/stages'
+import { demoStageView } from './biometricTuning'
 
 type SleepRecord = RouterOutputs['biometrics']['getSleepRecords'][number]
 
@@ -57,12 +58,14 @@ const emptyStages = (sleepRecordId: number | null = null, enteredBedAt: number |
   leftBedAt,
 })
 
-function stagesForNight(n: DemoNight) {
+async function stagesForNight(n: DemoNight) {
+  const stageView = await demoStageView(n.side)
   const end = n.leftBedAt?.getTime() ?? Date.now()
-  const epochs = demoStageEpochs(n, n.enteredBedAt.getTime(), end)
-  if (epochs.length === 0) return emptyStages(n.id, n.enteredBedAt.getTime(), n.leftBedAt?.getTime() ?? null)
+  const epochs = classifyDemoWindow(n.side, n.enteredBedAt.getTime(), end, stageView.classifier)
+  if (epochs.length === 0) return { ...emptyStages(n.id, n.enteredBedAt.getTime(), n.leftBedAt?.getTime() ?? null), stageView }
   return {
     epochs,
+    stageView,
     ...summarizeEpochs(epochs),
     sleepRecordId: n.id,
     enteredBedAt: n.enteredBedAt.getTime(),
@@ -113,6 +116,26 @@ export const biometrics: DemoHandlers<'biometrics'> = {
       })))
       .sort((a, b) => b.timestamp.getTime() - a.timestamp.getTime())
       .slice(0, input.limit ?? 288)
+  },
+
+  // Imported Apple Watch heart rate: one sample every five minutes, a touch
+  // below the pod's reading, so the Biometrics page shows the overlay.
+  getReferenceVitals: (input) => {
+    const start = input.startDate.getTime()
+    const end = input.endDate.getTime()
+    if (start > end) throw new TRPCError({ code: 'BAD_REQUEST', message: 'startDate must be before or equal to endDate' })
+    return demoVitals(input.side, start, end)
+      .filter((_, i) => i % 5 === 0)
+      .map(v => ({
+        id: Math.floor(v.t / 1000) * 2 + sideBit(input.side),
+        side: input.side,
+        source: 'apple_watch' as const,
+        timestamp: new Date(v.t),
+        heartRate: Math.round((v.heartRate - 1.5) * 10) / 10,
+        createdAt: new Date(v.t),
+      }))
+      .sort((a, b) => a.timestamp.getTime() - b.timestamp.getTime())
+      .slice(-(input.limit ?? 5000))
   },
 
   getVitalsSummary: (input) => {
@@ -190,11 +213,23 @@ export const biometrics: DemoHandlers<'biometrics'> = {
       const recent = night?.movement.filter(m => m.t >= now - 15 * MINUTE) ?? []
       const peakScore = recent.reduce((max, m) => Math.max(max, m.score), 0)
       const levelActive = night !== null
+      const occupied = levelActive || peakScore >= RESTLESS_SCORE_MIN
       return {
-        occupied: levelActive || peakScore >= RESTLESS_SCORE_MIN,
+        occupied,
         available: true,
+        classification: occupied ? 'person' as const : 'none' as const,
         movement: { active: peakScore >= RESTLESS_SCORE_MIN, peakScore },
-        level: { active: levelActive, deviation: levelActive ? 3.6 : 0.4, threshold: 1.5, ageMs: 420 },
+        level: {
+          active: levelActive,
+          deviation: levelActive ? 3.6 : 0.4,
+          threshold: 1.5,
+          ageMs: 420,
+          zoneDeviations: levelActive ? [1.3, 1.4, 0.9] : [0.2, 0.1, 0.1],
+          zones: levelActive ? 3 : 0,
+        },
+        vitals: levelActive
+          ? { heartRate: 58, breathingRate: 13, humanRange: true }
+          : { heartRate: null, breathingRate: null, humanRange: null },
       }
     }
     return { left: occupancy('left'), right: occupancy('right') }
@@ -224,7 +259,7 @@ export const biometrics: DemoHandlers<'biometrics'> = {
     return { success: true }
   },
 
-  getSleepStages: (input) => {
+  getSleepStages: async (input) => {
     if (input.sleepRecordId && (input.startDate || input.endDate)) {
       throw new TRPCError({ code: 'BAD_REQUEST', message: 'Provide either sleepRecordId or startDate/endDate, not both' })
     }
@@ -237,13 +272,14 @@ export const biometrics: DemoHandlers<'biometrics'> = {
     }
     if (input.startDate && input.endDate) {
       const { start, end } = range(input)
+      const stageView = await demoStageView(input.side)
       const epochs = demoNightsOverlapping(input.side, start, end)
         .reverse()
-        .flatMap(n => demoStageEpochs(n, Math.max(start, n.enteredBedAt.getTime()), Math.min(end, n.leftBedAt?.getTime() ?? Date.now())))
-      if (epochs.length === 0) return emptyStages()
-      return { epochs, ...summarizeEpochs(epochs), sleepRecordId: null, enteredBedAt: null, leftBedAt: null }
+        .flatMap(n => classifyDemoWindow(input.side, Math.max(start, n.enteredBedAt.getTime()), Math.min(end, n.leftBedAt?.getTime() ?? Date.now()), stageView.classifier))
+      if (epochs.length === 0) return { ...emptyStages(), stageView }
+      return { epochs, stageView, ...summarizeEpochs(epochs), sleepRecordId: null, enteredBedAt: null, leftBedAt: null }
     }
     const n = lastNight(input.side)
-    return n ? stagesForNight(n) : emptyStages()
+    return n ? stagesForNight(n) : { ...emptyStages(), stageView: await demoStageView(input.side) }
   },
 }

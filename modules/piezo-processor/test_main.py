@@ -40,6 +40,7 @@ _spec = importlib.util.spec_from_file_location(
     "common.bed_presence", Path(__file__).resolve().parent.parent / "common" / "bed_presence.py")
 _stubs["common.bed_presence"] = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(_stubs["common.bed_presence"])
+_stubs["common"].__path__ = [str(Path(__file__).resolve().parent.parent / "common")]
 sys.modules.update(_stubs)
 
 from main import (  # noqa: E402
@@ -52,6 +53,7 @@ from main import (  # noqa: E402
     FrzHealthPumpState,
     PUMP_OFF_GUARD_S,
     PUMP_ACTIVE_RPM_MIN,
+    PUMP_COUPLING_STD_FACTOR,
     HRTracker,
     PresenceDetector,
     PumpGate,
@@ -1086,6 +1088,222 @@ class TestWriteVitalsResilience:
         assert wrote is True
         rows = good.execute("SELECT side FROM vitals").fetchall()
         assert rows == [("right",)]
+
+
+class TestPresenceDetectorRelaxedReentry:
+    """With the bed confirmed occupied by the capacitance sensor, re-entry
+    uses the exit criteria instead of the (much higher) enter threshold, so a
+    sleeper who went quiet resumes vitals without a hard movement."""
+
+    def _absent_after_quiet(self):
+        pd = PresenceDetector()
+        pd.update(1_000_000, 0.8)
+        for _ in range(pd.exit_count):
+            pd.update(50_000, 0.05)
+        assert pd.state == PresenceDetector.ABSENT
+        return pd
+
+    def test_moderate_signal_does_not_reenter_by_default(self):
+        pd = self._absent_after_quiet()
+        # Between exit (150k) and enter (400k), autocorr below 0.45.
+        assert pd.update(250_000, 0.3) is False
+        assert pd.state == PresenceDetector.ABSENT
+
+    def test_moderate_signal_reenters_when_relaxed(self):
+        pd = self._absent_after_quiet()
+        assert pd.update(250_000, 0.3, relaxed=True) is True
+        assert pd.state == PresenceDetector.PRESENT
+        assert pd.consecutive_low == 0
+
+    def test_relaxed_reentry_on_autocorrelation_alone(self):
+        pd = self._absent_after_quiet()
+        # Energy still weak, but rhythm above the exit bar (0.225).
+        assert pd.update(50_000, 0.3, relaxed=True) is True
+
+    def test_weak_window_stays_absent_even_when_relaxed(self):
+        pd = self._absent_after_quiet()
+        assert pd.update(100_000, 0.1, relaxed=True) is False
+        assert pd.state == PresenceDetector.ABSENT
+
+    def test_relaxed_flag_does_not_change_exit_behaviour(self):
+        pd = PresenceDetector()
+        pd.update(1_000_000, 0.8, relaxed=True)
+        for _ in range(pd.exit_count - 1):
+            assert pd.update(50_000, 0.05, relaxed=True) is True
+        assert pd.update(50_000, 0.05, relaxed=True) is False
+        assert pd.state == PresenceDetector.ABSENT
+
+    def test_first_entry_from_cold_start_is_also_relaxed(self):
+        pd = PresenceDetector()
+        assert pd.update(200_000, 0.1, relaxed=True) is True
+
+
+class TestPumpCouplingGuardWithBedPresence:
+    """Both pumps running (Pod 5 steady state) raise the piezo re-entry bar
+    to PUMP_COUPLING_STD_FACTOR x enter and acr > 0.6. That guard exists to
+    tell a person from pump vibration; when the capacitance sensor already
+    says a person is in bed it must step aside. Regression for the 05:57-07:01
+    blackout on 2026-10-11 (sleeper went quiet, cap-sense occupied all along,
+    pumps at 1941/2008 rpm, piezo stayed ABSENT until a hard movement)."""
+
+    def _pumps_both_on(self):
+        ps = FrzHealthPumpState()
+        ps.update({"type": "frzHealth",
+                   "left": {"pumpRpm": 1941}, "right": {"pumpRpm": 2008}})
+        assert ps.is_symmetric_active()
+        return ps
+
+    def _proc(self, bed, acr):
+        import main
+        conn = TestWriteVitalsResilience()._make_db()
+        proc = main.SideProcessor("left", main.DBHolder(conn), pump_state=self._pumps_both_on())
+        seen = []
+        proc.sink = lambda cand: seen.append(cand) or True
+        if bed != "unset":
+            proc.bed_occupied = lambda: bed
+        return proc, seen
+
+    def _moderate_signal(self, proc):
+        """A BCG signal whose filtered energy clears the normal enter
+        threshold but not the pump-coupling bar."""
+        import main
+        np.random.seed(7)
+        sig = make_bcg_signal(62, 15, noise_level=0.05)
+        filt = main._bandpass(sig, 1.0, 10.0, FS)
+        w = int(5 * FS)
+        med = float(np.median([np.std(filt[j:j + w]) for j in range(0, len(filt) - w + 1, w)]))
+        enter = proc._presence.enter_threshold
+        assert enter < med < enter * PUMP_COUPLING_STD_FACTOR, med
+        return sig
+
+    def _run(self, bed, acr=0.5):
+        import main
+        proc, seen = self._proc(bed, acr)
+        sig = self._moderate_signal(proc)
+        # Autocorrelation above the normal bar (0.45) but below the coupling bar (0.6).
+        with patch("main._autocorr_quality", return_value=acr), \
+                patch("main.time.time", return_value=1_000_000.0):
+            proc.ingest(sig)
+        return proc, seen
+
+    def test_guard_suppresses_moderate_signal_when_bed_presence_unknown(self):
+        proc, seen = self._run(None)
+        assert proc._presence.state == PresenceDetector.ABSENT
+        assert seen == []
+
+    def test_guard_suppresses_when_no_bed_presence_configured(self):
+        proc, seen = self._run("unset")
+        assert proc._presence.state == PresenceDetector.ABSENT
+        assert seen == []
+
+    def test_bed_occupied_bypasses_guard_and_resumes_vitals(self):
+        proc, seen = self._run(True)
+        assert proc._presence.state == PresenceDetector.PRESENT
+        assert len(seen) == 1
+        assert seen[0].heart_rate is not None
+
+    def test_bed_occupied_relaxes_reentry_below_the_normal_enter_bar(self):
+        import main
+        proc, seen = self._proc(True, 0.3)
+        np.random.seed(7)
+        sig = make_bcg_signal(62, 15, noise_level=0.05) * 0.6
+        filt = main._bandpass(sig, 1.0, 10.0, FS)
+        w = int(5 * FS)
+        med = float(np.median([np.std(filt[j:j + w]) for j in range(0, len(filt) - w + 1, w)]))
+        assert proc._presence.exit_threshold < med < proc._presence.enter_threshold, med
+        with patch("main._autocorr_quality", return_value=0.3), \
+                patch("main.time.time", return_value=1_000_000.0):
+            proc.ingest(sig)
+        assert proc._presence.state == PresenceDetector.PRESENT
+        assert len(seen) == 1
+
+    def test_bed_empty_never_relaxes_the_guard(self):
+        proc, seen = self._run(False, acr=0.9)
+        assert proc._presence.state == PresenceDetector.ABSENT
+        assert seen == []
+
+    def test_weak_signal_in_an_occupied_bed_writes_nothing(self):
+        import main
+        proc, seen = self._proc(True, 0.05)
+        sig = make_noise(15, amplitude=20_000)
+        with patch("main._autocorr_quality", return_value=0.05), \
+                patch("main.time.time", return_value=1_000_000.0):
+            proc.ingest(sig)
+        assert proc._presence.state == PresenceDetector.ABSENT
+        assert seen == []
+
+    def test_cross_channel_rejected_side_is_not_relaxed_into_presence(self):
+        """Single-sleeper mode: both sides read the home side as occupied,
+        so the away side (coupling from the sleeper, weaker energy, rejected
+        by the other side's stronger signal) must stay ABSENT even though
+        its energy alone clears the relaxed re-entry bar."""
+        import main
+        proc, seen = self._proc(True, 0.3)
+        other = main.SideProcessor("right", main.DBHolder(TestWriteVitalsResilience()._make_db()))
+        other._last_med_std = proc._presence.enter_threshold * 2
+        other._last_acr_qual = 0.8
+        proc._other = other
+        np.random.seed(7)
+        sig = make_bcg_signal(62, 15, noise_level=0.05) * 0.6
+        with patch("main._autocorr_quality", return_value=0.3), \
+                patch("main.time.time", return_value=1_000_000.0):
+            proc.ingest(sig)
+        assert proc._last_acr_qual == 0.0
+        assert proc._presence.state == PresenceDetector.ABSENT
+        assert seen == []
+
+    def test_away_side_inherits_home_occupancy_but_not_relaxation(self):
+        """Single sleeper on the left: both processors read the left zone as
+        occupied. The right (away) side's own pump coupling, in the band the
+        guard exists for, must stay behind the guard — only the home side
+        may treat the merged occupancy as its own."""
+        import main
+        proc, seen = self._proc(True, 0.5)
+        proc.side = "right"
+        proc.home_side = lambda: "left"
+        sig = self._moderate_signal(proc)
+        with patch("main._autocorr_quality", return_value=0.5), \
+                patch("main.time.time", return_value=1_000_000.0):
+            proc.ingest(sig)
+        assert proc._presence.state == PresenceDetector.ABSENT
+        assert seen == []
+
+    def test_home_side_in_single_sleeper_mode_is_relaxed(self):
+        proc, seen = self._proc(True, 0.5)
+        proc.home_side = lambda: "left"
+        sig = self._moderate_signal(proc)
+        with patch("main._autocorr_quality", return_value=0.5), \
+                patch("main.time.time", return_value=1_000_000.0):
+            proc.ingest(sig)
+        assert proc._presence.state == PresenceDetector.PRESENT
+        assert len(seen) == 1
+
+    def test_later_cross_channel_rejection_ends_relaxed_presence(self):
+        """Relaxed entry before the sibling's values arrive, then the sibling
+        shows the stronger signal: rejection must count as weak windows so
+        presence exits through the normal hysteresis instead of latching on
+        energy alone."""
+        import main
+        proc, seen = self._proc(True, 0.3)
+        proc._pump_state = None
+        other = main.SideProcessor("right", main.DBHolder(TestWriteVitalsResilience()._make_db()))
+        proc._other = other
+        np.random.seed(7)
+        sig = make_bcg_signal(62, 15, noise_level=0.05) * 0.6
+        states = []
+        with patch("main._autocorr_quality", return_value=0.3):
+            for cycle in range(1 + proc._presence.exit_count):
+                if cycle == 1:
+                    other._last_med_std = proc._presence.enter_threshold * 2
+                    other._last_acr_qual = 0.8
+                with patch("main.time.time", return_value=1_000_000.0 + cycle * 61):
+                    proc.ingest(sig)
+                states.append(proc._presence.state)
+        assert states[0] == PresenceDetector.PRESENT
+        assert states[-1] == PresenceDetector.ABSENT
+        # Only the window before rejection produced vitals; the rejected
+        # windows advance the exit count but are never submitted.
+        assert len(seen) == 1
 
 
 class TestSideProcessorAbsenceThrottle:

@@ -20,6 +20,7 @@ vi.mock('@/src/hooks/useSchedule', () => ({
 vi.mock('@/src/providers/SideProvider', () => ({ useSide: () => ({ selectedSide: 'left' }) }))
 vi.mock('@/src/hooks/useSideNames', () => ({ useSideNames: () => ({ leftName: 'Jon', rightName: 'Heidi' }) }))
 vi.mock('@/src/hooks/useTemperatureUnit', () => ({ useTemperatureUnit: () => ({ unit: 'F' }) }))
+vi.mock('@/src/hooks/useCurveTemplates', () => ({ useCurveTemplates: () => ({ save: vi.fn(), isSaving: false }) }))
 
 const INITIAL = [
   { time: '07:00', temperature: 84 },
@@ -87,6 +88,7 @@ describe('CurveEditor', () => {
       setPoints: [{ time: '23:15', temperature: 84 }, { time: '07:00', temperature: 84 }],
       originalDays: ['monday'],
       endAction: 'turn_off',
+      notes: '',
     })
   })
 
@@ -182,19 +184,30 @@ it('updates a point from its dialog and keyboard chart, and can cancel a day con
   expect(m.saveCurve).not.toHaveBeenCalled()
 })
 
-it('loads an AI template into the local editor and saves only after review', async () => {
-  const { saveTemplate } = await import('@/src/lib/sleepCurve/curvePrompt')
-  saveTemplate({ reasoning: '', name: 'Test AI curve', bedtime: '22:00', wake: '07:00', points: { '22:00': 80, '02:00': 75, '07:00': 82 } })
+it('loads an imported AI curve into the local editor and saves only after review', async () => {
   const s = render(<CurveEditor onClose={vi.fn()} initialDays={['monday']} initialSetPoints={INITIAL} />)
   fireEvent.click(s.getByRole('button', { name: 'Custom AI curve' }))
-  fireEvent.click(s.getByRole('button', { name: /^Test AI curve/ }))
+  fireEvent.click(s.getByRole('button', { name: 'Import' }))
+  fireEvent.change(s.getByLabelText('AI response JSON'), {
+    target: { value: JSON.stringify({ name: 'Test AI curve', bedtime: '22:00', wake: '07:00', points: { '22:00': 80, '02:00': 75, '07:00': 82 }, reasoning: '' }) },
+  })
+  await waitFor(() => expect((s.getByRole('button', { name: 'Next' }) as HTMLButtonElement).disabled).toBe(false))
+  fireEvent.click(s.getByRole('button', { name: 'Next' }))
   fireEvent.click(s.getByRole('button', { name: 'Use curve' }))
   expect(s.queryByRole('dialog')).toBeNull()
   expect(m.saveCurve).not.toHaveBeenCalled()
   expect(rows(s)).toHaveLength(3)
   fireEvent.click(saveCurveButton(s))
   await waitFor(() => expect(m.saveCurve).toHaveBeenCalledWith(expect.objectContaining({ setPoints: expect.arrayContaining([{ time: '02:00', temperature: 75 }]) })))
-  localStorage.clear()
+})
+
+it('edits the optional note and saves it with the curve', async () => {
+  const s = render(<CurveEditor onClose={vi.fn()} initialDays={['monday']} initialSetPoints={INITIAL} initialNotes="Old note" />)
+  const notes = s.getByLabelText(/Notes/) as HTMLTextAreaElement
+  expect(notes.value).toBe('Old note')
+  fireEvent.change(notes, { target: { value: 'Based on 14 nights' } })
+  fireEvent.click(saveCurveButton(s))
+  await waitFor(() => expect(m.saveCurve).toHaveBeenCalledWith(expect.objectContaining({ notes: 'Based on 14 nights' })))
 })
 
 it('subscribes to desktop layout changes and removes the listener on unmount', () => {
