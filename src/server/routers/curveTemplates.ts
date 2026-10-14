@@ -5,6 +5,7 @@ import { publicProcedure, router } from '@/src/server/trpc'
 import { db } from '@/src/db'
 import { curveTemplates } from '@/src/db/schema'
 import { temperatureSchema, timeStringSchema } from '@/src/server/validation-schemas'
+import { CURVE_NOTES_MAX } from '@/src/lib/sleepCurve/savePlan'
 
 /**
  * Saved curves: named set point lists (°F) that are not tied to a side or a
@@ -23,7 +24,7 @@ const curveTemplateOutput = z.object({
   bedtime: z.string(),
   wake: z.string(),
   points: z.record(z.string(), z.number()),
-  reasoning: z.string(),
+  notes: z.string(),
   createdAt: z.date(),
   updatedAt: z.date(),
 })
@@ -60,7 +61,7 @@ export const curveTemplatesRouter = router({
       bedtime: timeStringSchema,
       wake: timeStringSchema,
       points: pointsSchema,
-      reasoning: z.string().max(2000).default(''),
+      notes: z.string().max(CURVE_NOTES_MAX).default(''),
     }).strict())
     .output(curveTemplateOutput)
     .mutation(({ input }) => {
@@ -70,7 +71,7 @@ export const curveTemplatesRouter = router({
           .values({ ...input, createdAt: now, updatedAt: now })
           .onConflictDoUpdate({
             target: curveTemplates.name,
-            set: { bedtime: input.bedtime, wake: input.wake, points: input.points, reasoning: input.reasoning, updatedAt: now },
+            set: { bedtime: input.bedtime, wake: input.wake, points: input.points, notes: input.notes, updatedAt: now },
           })
           .returning()
           .get()

@@ -8,6 +8,9 @@ import { simplifySetPoints } from '@/src/lib/scheduleGrouping'
 import type { DayOfWeek } from '@/src/lib/scheduleTime'
 
 type Side = 'left' | 'right'
+
+/** Longest curve note, shared by day notes and saved curves so either can be applied as the other. */
+export const CURVE_NOTES_MAX = 1000
 export type CurveEndAction = 'turn_off' | 'maintain'
 
 interface ExistingRow {
@@ -28,6 +31,8 @@ export interface CurveSavePlan {
   /** Auto on/off window, or null when the curve cannot define one. */
   power: CurvePowerWindow | null
   deletes: { temperature: number[], power: number[] }
+  /** The curve's note on each target day; null clears the note on days only being cleared. */
+  notes: Array<{ side: Side, dayOfWeek: DayOfWeek, notes: string | null }>
   creates: {
     temperature: Array<{ side: Side, dayOfWeek: DayOfWeek, time: string, temperature: number, enabled: boolean }>
     power: Array<{ side: Side, dayOfWeek: DayOfWeek, onTime: string, offTime: string, endAction: CurveEndAction, onTemperature: number, enabled: boolean }>
@@ -48,6 +53,7 @@ export function planCurveSave({
   clearDays = targetDays,
   setPoints,
   endAction = 'turn_off',
+  notes,
   existing,
 }: {
   sides: Side[]
@@ -55,12 +61,15 @@ export function planCurveSave({
   clearDays?: DayOfWeek[]
   setPoints: SetPoint[]
   endAction?: CurveEndAction
+  /** Note for the curve; omitted or blank clears any note on those days. */
+  notes?: string | null
   existing: { temperature: ExistingRow[], power: ExistingRow[] }
 }): CurveSavePlan {
-  const daysToClear = new Set<string>([...clearDays, ...targetDays])
+  const daysToClear = new Set<DayOfWeek>([...clearDays, ...targetDays])
+  const clearing = new Set<string>(daysToClear)
   const deletes = {
-    temperature: existing.temperature.filter(t => daysToClear.has(t.dayOfWeek)).map(t => t.id),
-    power: existing.power.filter(p => daysToClear.has(p.dayOfWeek)).map(p => p.id),
+    temperature: existing.temperature.filter(t => clearing.has(t.dayOfWeek)).map(t => t.id),
+    power: existing.power.filter(p => clearing.has(p.dayOfWeek)).map(p => p.id),
   }
 
   // Rows inside a flat hold are dropped; they never change what the Pod does.
@@ -82,5 +91,11 @@ export function planCurveSave({
     }
   }
 
-  return { setPoints: sortedPoints, power, deletes, creates }
+  const note = notes?.trim().slice(0, CURVE_NOTES_MAX) || null
+  const targets = new Set(targetDays)
+  const noteRows = sides.flatMap(side => [...daysToClear].map(dayOfWeek => ({
+    side, dayOfWeek, notes: targets.has(dayOfWeek) ? note : null,
+  })))
+
+  return { setPoints: sortedPoints, power, deletes, notes: noteRows, creates }
 }

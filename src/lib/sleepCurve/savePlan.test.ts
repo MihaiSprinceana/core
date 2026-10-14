@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { planCurveSave } from './savePlan'
+import { CURVE_NOTES_MAX, planCurveSave } from './savePlan'
 
 const existing = {
   temperature: [{ id: 1, dayOfWeek: 'monday' }, { id: 2, dayOfWeek: 'tuesday' }, { id: 3, dayOfWeek: 'wednesday' }],
@@ -39,5 +39,24 @@ describe('planCurveSave', () => {
     expect(planCurveSave(base).power).toBeNull()
     expect(planCurveSave(base).creates.power).toEqual([])
     expect(planCurveSave({ ...base, endAction: 'maintain' }).power).toEqual({ onTime: '22:00', offTime: '22:00', onTemperature: 70, endAction: 'maintain' })
+  })
+
+  it('writes the trimmed note to target days and clears days that are only being cleared', () => {
+    const plan = planCurveSave({
+      sides: ['left'],
+      targetDays: ['monday'],
+      clearDays: ['tuesday'],
+      setPoints: [{ time: '22:00', temperature: 70 }, { time: '06:00', temperature: 80 }],
+      notes: '  Warm sleeper  ',
+      existing: { temperature: [], power: [] },
+    })
+    expect(plan.notes).toEqual([
+      { side: 'left', dayOfWeek: 'tuesday', notes: null },
+      { side: 'left', dayOfWeek: 'monday', notes: 'Warm sleeper' },
+    ])
+    const blank = planCurveSave({ sides: ['left'], targetDays: ['monday'], setPoints: [{ time: '22:00', temperature: 70 }], notes: ' ', existing: { temperature: [], power: [] } })
+    expect(blank.notes).toEqual([{ side: 'left', dayOfWeek: 'monday', notes: null }])
+    const long = planCurveSave({ sides: ['left'], targetDays: ['monday'], setPoints: [{ time: '22:00', temperature: 70 }], notes: 'x'.repeat(CURVE_NOTES_MAX + 5), existing: { temperature: [], power: [] } })
+    expect(long.notes[0].notes).toHaveLength(CURVE_NOTES_MAX)
   })
 })
