@@ -149,6 +149,94 @@ docs/research/sleep-stage-calibration/feat2.py dataset.csv
 
 It needs numpy and scikit-learn; its shebang pulls them through `uv`.
 
+## 6. Personal models, container side
+
+`personal-models.py` trains the two ojwalch/sleep_classifiers models (logistic
+regression, random forest with 200 trees of depth 4) on the same features the
+iPhone computes for its on-device personal models
+(sleepypod-ios `docs/design/on-device-stage-training.md`), so the container
+run and the phone fit can be cross-checked:
+
+```sh
+docs/research/sleep-stage-calibration/personal-models.py dataset.csv --contract A   # the challenger's four inputs
+docs/research/sleep-stage-calibration/personal-models.py dataset.csv --contract B   # pod native: adds HRV, breathing, 15-min windows
+```
+
+Rows are 5-minute epochs from each night's first Watch-labeled sample, labeled
+by the Watch stage at the epoch midpoint, rare classes oversampled instead of
+class-weighted (Create ML has no class weights), scored leave-one-night-out
+with Cohen's κ against the Watch, pooled and per night. On the ten left-side
+nights to 2026-10-18 (724 labeled epochs):
+
+| contract | logistic κ | forest κ |
+|---|---|---|
+| A | 0.08 | 0.05 |
+| B | 0.11 | 0.20 |
+
+The bundled challenger scores κ 0.12 on these nights and the pod's rules about
+0.02, so contract B's forest is the first model to clear both.
+
+Two parity checks keep the container and the phone honest:
+
+- Features: `--fixture night-fixture.json` writes a synthetic night's raw rows
+  (deterministic, nobody's sleep) and the feature rows under both contracts.
+  Copy it to `sleepypod-ios/SleepypodTests/Fixtures/stage-features-night.json`;
+  the Swift `StageFeatureParityTests` suite recomputes every column from the raw
+  rows and fails on any difference above 1e-6. `--fixture-real` uses the first
+  real labeled night instead, for a local check only: it carries timestamps and
+  per-minute biometrics and must never be committed.
+- Conversion: `--export out/` fits each model on all nights and writes
+  `personal-<kind>.mlmodel` with a card in the challenger's schema (test vectors
+  are the model's own predictions on 12 training rows). The phone's
+  `StageChallenger.load(modelURL:cardURL:)` refuses a model that fails its
+  vectors, so a converter mismatch shows up at load. Needs `coremltools`
+  (`uv run --with coremltools …`).
+
+### One command on the Mac
+
+`scripts/train-personal-models.py` chains the whole thing: snapshot the pod's
+database over SSH, build the dataset, train both models on a contract with
+leave-one-night-out scoring, export the pod form, and upload the model with
+the higher pooled κ. About five seconds on Apple silicon; nothing runs on the
+phone.
+
+```sh
+scripts/train-personal-models.py --pod <pod-ip> --side left            # contract B, best model, uploaded
+scripts/train-personal-models.py --pod <pod-ip> --side left --no-upload --contract A
+scripts/train-personal-models.py --pod <pod-ip> --snapshot poddb/biometrics.db   # reuse a snapshot
+```
+
+The pod needs the model endpoints below, and the Watch stages must already be
+on it (section 2b).
+
+### Running a model on the pod
+
+`--export out/` also writes `personal-<kind>.json`, the pod's portable form
+(forest trees as parallel arrays with four-class leaf votes, logistic as
+scaler plus weights, the feature contract, hyperparameters and the test
+vectors), checked against scikit-learn on every training row before it is
+written. The pod evaluates it with `src/lib/personal-stage-model.ts`, which
+computes the same feature contracts from a night's vitals and movement (the
+same synthetic fixture is replayed by `src/lib/tests/personal-stage-model.test.ts`)
+and refuses a model that fails its own test vectors.
+
+```sh
+# store the container's forest on the pod for the left side
+curl -X PUT http://<pod-ip>:3000/api/sleep-stages/model   -H 'content-type: application/json'   -d "$(jq -c '{side:"left", model:.}' out/personal-forest.json)"
+# score it beside the rules against the Watch on the last 14 nights
+curl -X POST http://<pod-ip>:3000/api/sleep-stages/model/preview   -H 'content-type: application/json' -d '{"side":"left","nights":14}'
+```
+
+The stored model is scored on read next to the side's rules; it does not yet
+replace them as the side's classifier, because the classifier is pinned to
+the hashed biometrics manifest through the profile system and a new engine
+there is a migration of its own. On the ten left-side nights to 2026-10-19
+the container's contract-B forest, evaluated by the pod's TypeScript,
+reached in-sample κ 0.33 (leave-one-night-out 0.20 in training).
+
+The Mac analysis container is not checked in here; add its Dockerfile location
+when it is.
+
 ## Tests
 
 ```sh
